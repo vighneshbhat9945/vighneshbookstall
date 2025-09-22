@@ -1,1 +1,396 @@
-<h1>Vighnesh Bookstall Ankola</h1>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Items Manager — Save JSON to GitHub</title>
+<style>
+  :root{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;margin:0}
+  body{display:flex;gap:24px;flex-direction:column;align-items:center;padding:24px;background:#f7fafc;color:#111}
+  .card{background:#fff;padding:18px;border-radius:12px;box-shadow:0 6px 18px rgba(10,10,10,.06);width:940px;max-width:96%}
+  h1{margin:0 0 12px;font-size:20px}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:8px}
+  label{font-size:12px;color:#555}
+  input[type=text], input[type=password], select{width:100%;padding:8px;border-radius:8px;border:1px solid #e6e9ef}
+  .controls{display:flex;gap:8px;align-items:center;margin-top:8px}
+  button{padding:8px 12px;border-radius:8px;border:0;background:#0f62fe;color:#fff;cursor:pointer}
+  button.ghost{background:#eef2ff;color:#0f62fe;border:1px solid #dbe7ff}
+  .row{display:flex;gap:8px;align-items:center}
+  .items{margin-top:16px}
+  .item{display:flex;align-items:center;gap:8px;padding:8px;border-radius:8px;border:1px solid #f0f3f7;margin-bottom:8px;background:#fcfdff}
+  .item input[type=text]{flex:1;border:0;padding:6px;background:transparent}
+  .meta{font-size:12px;color:#666}
+  .status{margin-left:auto;font-size:12px;color:#666}
+  .small{font-size:13px;color:#444}
+  .danger{background:#ff4d4f}
+  .footer{margin-top:12px;font-size:12px;color:#666}
+  .note{background:#fffbe6;padding:8px;border-radius:8px;border:1px solid #fff2b8;margin-top:12px}
+  textarea{width:100%;min-height:80px;padding:8px;border-radius:8px;border:1px solid #e6e9ef}
+  .muted{color:#888;font-size:12px}
+</style>
+</head>
+<body>
+
+<div class="card" id="app">
+  <h1>Items Manager — CRUD with GitHub JSON storage</h1>
+
+  <div class="grid">
+    <div>
+      <label>GitHub Owner (username/org)</label>
+      <input id="owner" type="text" placeholder="your-username-or-org" value="" />
+    </div>
+    <div>
+      <label>Repository name</label>
+      <input id="repo" type="text" placeholder="repo-name" value="" />
+    </div>
+    <div>
+      <label>File path (where JSON is stored)</label>
+      <input id="path" type="text" placeholder="data/items.json" value="items.json" />
+    </div>
+    <div>
+      <label>Branch</label>
+      <input id="branch" type="text" placeholder="main" value="main" />
+    </div>
+  </div>
+
+  <div class="grid">
+    <div style="grid-column: span 3;">
+      <label>Personal Access Token (PAT)</label>
+      <input id="token" type="password" placeholder="Paste your token here (keeps in memory only)" />
+      <div class="muted">Token requires repo contents access. For public repos you may use a token limited to that repo. See warnings below.</div>
+    </div>
+    <div>
+      <label>&nbsp;</label>
+      <div style="display:flex;gap:8px">
+        <button id="connectBtn">Load from GitHub</button>
+        <button id="createFileBtn" class="ghost">Create empty file</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <div style="flex:1">
+      <label class="small">Add item</label>
+      <div style="display:flex;gap:8px;margin-top:6px">
+        <input id="newTitle" type="text" placeholder="Item title" />
+        <input id="newNote" type="text" placeholder="Note / description" />
+        <button id="addBtn">Add</button>
+      </div>
+    </div>
+
+    <div style="width:280px">
+      <label class="small">Search</label>
+      <input id="search" type="text" placeholder="filter items" />
+    </div>
+  </div>
+
+  <div id="status" class="meta" style="margin-top:10px">Not connected</div>
+
+  <div class="items" id="itemsList" aria-live="polite"></div>
+
+  <div class="note">
+    <strong>How it works:</strong>
+    This page reads/writes the JSON file in your GitHub repo using the Contents API. On load it fetches the file (base64 → JSON). When you add/edit/delete, it commits the updated JSON back as a new commit to the branch.
+  </div>
+
+  <div class="footer">
+    <div class="muted">Security reminder: A token used here will live in the browser memory. Do not use a token that you cannot revoke. For production choose a server-side approach (serverless function, GitHub App, or a backend proxy).</div>
+  </div>
+</div>
+
+<script>
+/*
+  Simple single-file app that:
+   - loads items JSON from GitHub repo
+   - shows UI to create / update / delete items
+   - saves JSON to the same file via GitHub API (PUT /repos/{owner}/{repo}/contents/{path})
+*/
+
+const el = id => document.getElementById(id);
+let state = {
+  owner: '',
+  repo: '',
+  path: 'items.json',
+  branch: 'main',
+  token: '',
+  items: [],
+  fileSha: null,
+  saving: false,
+  autoSaveTimer: null
+};
+
+function showStatus(txt, isError=false){
+  const s = el('status');
+  s.textContent = txt;
+  s.style.color = isError ? '#b02a37' : '#333';
+}
+
+function base64Encode(str){
+  // safe utf-8 to base64
+  return btoa(unescape(encodeURIComponent(str)));
+}
+function base64Decode(b){
+  try {
+    return decodeURIComponent(escape(atob(b)));
+  } catch(e){
+    // fallback
+    return atob(b);
+  }
+}
+
+function apiBase(){
+  return 'https://api.github.com';
+}
+
+async function fetchFile(){
+  showStatus('Loading file from GitHub...');
+  const url = `${apiBase()}/repos/${state.owner}/${state.repo}/contents/${encodeURIComponent(state.path)}?ref=${encodeURIComponent(state.branch)}`;
+  const resp = await fetch(url, {
+    headers: {
+      Accept: 'application/vnd.github.v3+json',
+      Authorization: state.token ? ('token ' + state.token) : undefined
+    }
+  });
+  if(resp.status === 404){
+    showStatus('File not found — you can click "Create empty file" to create it.');
+    state.fileSha = null;
+    state.items = [];
+    renderItems();
+    return null;
+  }
+  if(!resp.ok) {
+    const text = await resp.text();
+    showStatus('Failed to fetch file: ' + resp.status, true);
+    console.error('fetchFile error', resp.status, text);
+    throw new Error('Failed to fetch file: ' + resp.status);
+  }
+  const data = await resp.json();
+  // data.content is base64
+  const content = base64Decode(data.content.replace(/\n/g,''));
+  try {
+    state.items = JSON.parse(content);
+    if(!Array.isArray(state.items)) state.items = [];
+  } catch(e){
+    showStatus('File parsed but JSON invalid — starting with empty list.', true);
+    console.error('JSON parse error', e);
+    state.items = [];
+  }
+  state.fileSha = data.sha;
+  renderItems();
+  showStatus(`Loaded ${state.items.length} items. (sha: ${state.fileSha})`);
+  return data;
+}
+
+function renderItems(){
+  const list = el('itemsList');
+  list.innerHTML = '';
+  const query = el('search').value.trim().toLowerCase();
+  const itemsToShow = state.items.filter(it => (it.title + ' ' + (it.note || '')).toLowerCase().includes(query));
+  if(itemsToShow.length === 0){
+    list.innerHTML = '<div class="muted">No items</div>';
+    return;
+  }
+  itemsToShow.forEach((item, idx) => {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'item';
+    const titleIn = document.createElement('input');
+    titleIn.type = 'text';
+    titleIn.value = item.title || '';
+    titleIn.addEventListener('input', () => {
+      item.title = titleIn.value;
+      scheduleSave();
+    });
+
+    const noteIn = document.createElement('input');
+    noteIn.type = 'text';
+    noteIn.value = item.note || '';
+    noteIn.style.width = '260px';
+    noteIn.addEventListener('input', () => {
+      item.note = noteIn.value;
+      scheduleSave();
+    });
+
+    const idSpan = document.createElement('div');
+    idSpan.className = 'meta';
+    idSpan.textContent = item.id ? `id:${item.id}` : '';
+
+    const created = document.createElement('div');
+    created.className = 'meta';
+    created.textContent = item.createdAt ? new Date(item.createdAt).toLocaleString() : '';
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'ghost';
+    delBtn.textContent = 'Delete';
+    delBtn.addEventListener('click', () => {
+      if(!confirm('Delete item?')) return;
+      const i = state.items.indexOf(item);
+      if(i >= 0) state.items.splice(i,1);
+      renderItems();
+      immediateSave();
+    });
+
+    wrapper.appendChild(titleIn);
+    wrapper.appendChild(noteIn);
+    wrapper.appendChild(idSpan);
+    wrapper.appendChild(created);
+    wrapper.appendChild(delBtn);
+    list.appendChild(wrapper);
+  });
+}
+
+function scheduleSave(delay = 900){
+  if(state.autoSaveTimer) clearTimeout(state.autoSaveTimer);
+  state.autoSaveTimer = setTimeout(() => {
+    immediateSave();
+  }, delay);
+}
+async function immediateSave(){
+  if(state.saving) return;
+  // set saving flag
+  state.saving = true;
+  showStatus('Saving to GitHub...');
+  try {
+    await saveFile(state.items, `Update items (${new Date().toISOString()})`);
+    showStatus('Saved to GitHub — sha: ' + state.fileSha);
+  } catch(e){
+    console.error(e);
+    showStatus('Save failed: ' + (e.message||e), true);
+  } finally {
+    state.saving = false;
+  }
+}
+
+async function saveFile(items, message){
+  // Ensure owner/repo/path set
+  if(!state.owner || !state.repo || !state.path) {
+    throw new Error('owner / repo / path not set');
+  }
+  const url = `${apiBase()}/repos/${state.owner}/${state.repo}/contents/${encodeURIComponent(state.path)}`;
+  const bodyObj = {
+    message: message || `Update items ${new Date().toISOString()}`,
+    content: base64Encode(JSON.stringify(items, null, 2)),
+    branch: state.branch
+  };
+  if(state.fileSha) bodyObj.sha = state.fileSha;
+  const resp = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      Accept: 'application/vnd.github.v3+json',
+      Authorization: state.token ? ('token ' + state.token) : undefined,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(bodyObj)
+  });
+  const data = await resp.json();
+  if(!resp.ok){
+    const msg = data && data.message ? data.message : JSON.stringify(data);
+    throw new Error('GitHub save error: ' + msg);
+  }
+  // successful — response.content.sha
+  if(data.content && data.content.sha){
+    state.fileSha = data.content.sha;
+  }
+  return data;
+}
+
+// Helpers to modify state
+function addItem(title, note){
+  if(!title) return;
+  const newItem = {
+    id: Math.random().toString(36).slice(2,9),
+    title: title,
+    note: note || '',
+    createdAt: new Date().toISOString()
+  };
+  state.items.unshift(newItem);
+  renderItems();
+  immediateSave();
+}
+
+function createEmptyFile(){
+  // create file with [] as content
+  state.items = [];
+  renderItems();
+  immediateSave();
+}
+
+// UI wiring
+el('connectBtn').addEventListener('click', async () => {
+  state.owner = el('owner').value.trim();
+  state.repo = el('repo').value.trim();
+  state.path = el('path').value.trim() || 'items.json';
+  state.branch = el('branch').value.trim() || 'main';
+  state.token = el('token').value.trim();
+  if(!state.owner || !state.repo){
+    showStatus('Please enter owner and repo.', true);
+    return;
+  }
+  try {
+    await fetchFile();
+  } catch(err){
+    showStatus('Error: ' + err.message, true);
+  }
+});
+
+el('createFileBtn').addEventListener('click', async () => {
+  state.owner = el('owner').value.trim();
+  state.repo = el('repo').value.trim();
+  state.path = el('path').value.trim() || 'items.json';
+  state.branch = el('branch').value.trim() || 'main';
+  state.token = el('token').value.trim();
+  if(!state.owner || !state.repo){
+    showStatus('Please enter owner and repo.', true);
+    return;
+  }
+  state.items = [];
+  try {
+    await saveFile(state.items, 'Create items file (initial)');
+    showStatus('File created and saved. sha: ' + state.fileSha);
+    renderItems();
+  } catch(e){
+    showStatus('Create failed: ' + e.message, true);
+    console.error(e);
+  }
+});
+
+el('addBtn').addEventListener('click', () => {
+  const t = el('newTitle').value.trim();
+  const n = el('newNote').value.trim();
+  if(!t) return alert('Enter title');
+  addItem(t,n);
+  el('newTitle').value = '';
+  el('newNote').value = '';
+});
+
+el('search').addEventListener('input', () => renderItems());
+
+// load defaults from localStorage (non-sensitive)
+window.addEventListener('load', () => {
+  try {
+    el('owner').value = localStorage.getItem('gh_owner') || '';
+    el('repo').value = localStorage.getItem('gh_repo') || '';
+    el('path').value = localStorage.getItem('gh_path') || 'items.json';
+    el('branch').value = localStorage.getItem('gh_branch') || 'main';
+  } catch(e){}
+});
+
+// persist non-sensitive form fields
+['owner','repo','path','branch'].forEach(id => {
+  el(id).addEventListener('change', () => {
+    try {
+      localStorage.setItem('gh_'+id, el(id).value.trim());
+    } catch(e){}
+  });
+});
+
+// keyboard shortcuts
+document.addEventListener('keydown', (e) => {
+  if((e.ctrlKey || e.metaKey) && e.key === 's'){
+    e.preventDefault();
+    immediateSave();
+  }
+});
+</script>
+
+</body>
+</html>
